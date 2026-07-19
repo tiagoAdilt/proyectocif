@@ -1,96 +1,294 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../../lib/supabase';
+import { cifrar, descifrar } from '../../lib/cifrado';
+import DOMPurify from 'dompurify';
+import { z } from 'zod';
 
-function evaluarContrasena(password: string) {
-  let puntaje = 0;
-  if (password.length >= 8) puntaje++;
-  if (password.length >= 12) puntaje++;
-  if (/[A-Z]/.test(password)) puntaje++;
-  if (/[0-9]/.test(password)) puntaje++;
-  if (/[^A-Za-z0-9]/.test(password)) puntaje++;
+const mensajeSchema = z.string().min(1, 'El mensaje no puede estar vacio').max(2000, 'El mensaje es demasiado largo');
+const claveSchema = z.string().min(3, 'La clave debe tener al menos 3 caracteres');
 
-  if (puntaje <= 1) return { nivel: 'Muy debil', color: '#ef4444', ancho: '20%' };
-  if (puntaje === 2) return { nivel: 'Debil', color: '#f97316', ancho: '40%' };
-  if (puntaje === 3) return { nivel: 'Media', color: '#eab308', ancho: '60%' };
-  if (puntaje === 4) return { nivel: 'Fuerte', color: '#3b82f6', ancho: '80%' };
-  return { nivel: 'Muy fuerte', color: '#22c55e', ancho: '100%' };
-}
-
-export default function LoginPage() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [esRegistro, setEsRegistro] = useState(false);
+export default function ChatPage() {
+  const [usuario, setUsuario] = useState<any>(null);
+  const [usuarios, setUsuarios] = useState<any[]>([]);
+  const [contactoSeleccionado, setContactoSeleccionado] = useState<any>(null);
+  const [mensajes, setMensajes] = useState<any[]>([]);
   const [mensaje, setMensaje] = useState('');
-  const [cargando, setCargando] = useState(false);
+  const [claveVig, setClaveVig] = useState('');
+  const [claveAes, setClaveAes] = useState('');
+  const [clavesConfiguradas, setClavesConfiguradas] = useState(false);
+  const [conversacionId, setConversacionId] = useState<string | null>(null);
+  const [errorMensaje, setErrorMensaje] = useState('');
+  const mensajesRef = useRef<HTMLDivElement>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const fortaleza = password ? evaluarContrasena(password) : null;
-
-  const handleSubmit = async () => {
-    if (esRegistro && password.length < 8) {
-      setMensaje('La contrasena debe tener al menos 8 caracteres.');
-      return;
-    }
-    setCargando(true);
-    setMensaje('');
-    if (esRegistro) {
-      const { error } = await supabase.auth.signUp({ email, password });
-      if (error) setMensaje('Error: ' + error.message);
-      else setMensaje('Registro exitoso. Ya podes iniciar sesion.');
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) setMensaje('Error: ' + error.message);
-      else window.location.href = '/chat';
-    }
-    setCargando(false);
+  const resetTimeout = () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      alert('Sesion cerrada por inactividad.');
+      supabase.auth.signOut();
+      window.location.href = '/login';
+    }, 15 * 60 * 1000);
   };
 
-  return (
-    <main className="min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center p-6">
-      <div className="w-full max-w-sm bg-gray-900 rounded-xl border border-gray-800 p-8">
-        <h1 className="text-2xl font-semibold mb-1 text-center">Sistema de Cifrado</h1>
-        <p className="text-gray-500 text-sm mb-8 text-center">E.E.T. N°3139</p>
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      if (!data.user) window.location.href = '/login';
+      else {
+        setUsuario(data.user);
+        cargarUsuarios(data.user.id);
+      }
+    });
+  }, []);
 
-        <div className="flex gap-2 mb-6">
-          <button onClick={() => { setEsRegistro(false); setMensaje(''); }}
-            className={`flex-1 py-2 rounded-lg text-sm ${!esRegistro ? 'bg-blue-600 text-white' : 'border border-gray-700 text-gray-400'}`}>
-            Iniciar sesion
-          </button>
-          <button onClick={() => { setEsRegistro(true); setMensaje(''); }}
-            className={`flex-1 py-2 rounded-lg text-sm ${esRegistro ? 'bg-blue-600 text-white' : 'border border-gray-700 text-gray-400'}`}>
-            Registrarse
-          </button>
+  useEffect(() => {
+    resetTimeout();
+    window.addEventListener('mousemove', resetTimeout);
+    window.addEventListener('keydown', resetTimeout);
+    return () => {
+      window.removeEventListener('mousemove', resetTimeout);
+      window.removeEventListener('keydown', resetTimeout);
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (mensajesRef.current) {
+      mensajesRef.current.scrollTop = mensajesRef.current.scrollHeight;
+    }
+  }, [mensajes]);
+
+  const cargarUsuarios = async (miId: string) => {
+    const { data } = await supabase
+      .from('usuarios')
+      .select('*')
+      .neq('id', miId);
+    if (data) setUsuarios(data);
+  };
+
+  const seleccionarContacto = (contacto: any) => {
+    setContactoSeleccionado(contacto);
+    setClavesConfiguradas(false);
+    setMensajes([]);
+    setConversacionId(null);
+    setClaveVig('');
+    setClaveAes('');
+    setErrorMensaje('');
+  };
+
+  const configurarClaves = async () => {
+    const vigResult = claveSchema.safeParse(claveVig);
+    const aesResult = claveSchema.safeParse(claveAes);
+
+    if (!vigResult.success) { alert('Clave Vigenere invalida: ' + vigResult.error.errors[0].message); return; }
+    if (!aesResult.success) { alert('Clave AES invalida: ' + aesResult.error.errors[0].message); return; }
+    if (!usuario || !contactoSeleccionado) return;
+
+    const { data: existente } = await supabase
+      .from('conversaciones')
+      .select('*')
+      .or(`and(usuario_a.eq.${usuario.id},usuario_b.eq.${contactoSeleccionado.id}),and(usuario_a.eq.${contactoSeleccionado.id},usuario_b.eq.${usuario.id})`)
+      .single();
+
+    let convId = existente?.id;
+
+    if (!convId) {
+      const { data, error } = await supabase
+        .from('conversaciones')
+        .insert({ usuario_a: usuario.id, usuario_b: contactoSeleccionado.id })
+        .select()
+        .single();
+      if (error) { alert('Error: ' + error.message); return; }
+      convId = data.id;
+    }
+
+    setConversacionId(convId);
+    setClavesConfiguradas(true);
+    await cargarMensajes(convId, claveVig, claveAes);
+    suscribirMensajes(convId, claveVig, claveAes);
+  };
+
+  const cargarMensajes = async (convId: string, vig: string, aes: string) => {
+    const { data } = await supabase
+      .from('mensajes')
+      .select('*')
+      .eq('conversacion_id', convId)
+      .order('created_at', { ascending: true });
+
+    if (data) {
+      const descifrados = data.map(msg => {
+        try {
+          const texto = descifrar(msg.contenido_cifrado, vig, aes);
+          return { ...msg, texto, integro: true };
+        } catch {
+          return { ...msg, texto: '[No se pudo descifrar]', integro: false };
+        }
+      });
+      setMensajes(descifrados);
+    }
+  };
+
+  const suscribirMensajes = (convId: string, vig: string, aes: string) => {
+    supabase
+      .channel('mensajes-' + convId)
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'mensajes',
+        filter: `conversacion_id=eq.${convId}`,
+      }, (payload) => {
+        const msg = payload.new as any;
+        try {
+          const texto = descifrar(msg.contenido_cifrado, vig, aes);
+          setMensajes(prev => [...prev, { ...msg, texto, integro: true }]);
+        } catch {
+          setMensajes(prev => [...prev, { ...msg, texto: '[No se pudo descifrar]', integro: false }]);
+        }
+      })
+      .subscribe();
+  };
+
+  const enviarMensaje = async () => {
+    if (!clavesConfiguradas || !conversacionId || !usuario) return;
+
+    const resultado = mensajeSchema.safeParse(mensaje);
+    if (!resultado.success) {
+      setErrorMensaje(resultado.error.errors[0].message);
+      return;
+    }
+
+    setErrorMensaje('');
+
+    try {
+      const mensajeLimpio = DOMPurify.sanitize(mensaje).trim();
+      if (!mensajeLimpio) return;
+      const contenidoCifrado = cifrar(mensajeLimpio, claveVig, claveAes);
+      
+      await supabase.from('mensajes').insert({
+        conversacion_id: conversacionId,
+        emisor_id: usuario.id,
+        contenido_cifrado: contenidoCifrado,
+        hash,
+      });
+
+      setMensaje('');
+    } catch (e: any) {
+      alert('Error al cifrar: ' + e.message);
+    }
+  };
+
+  const cerrarSesion = async () => {
+    await supabase.auth.signOut();
+    window.location.href = '/login';
+  };
+
+  if (!usuario) return null;
+
+  return (
+    <main className="min-h-screen bg-gray-950 text-gray-100 flex flex-col">
+      <header className="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-lg font-semibold">Sistema de Cifrado</h1>
+          <p className="text-xs text-gray-500">{usuario.email}</p>
+        </div>
+        <button onClick={cerrarSesion}
+          className="text-sm text-gray-400 hover:text-white border border-gray-700 px-4 py-2 rounded-lg">
+          Cerrar sesion
+        </button>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        <div className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
+          <div className="p-4 border-b border-gray-800">
+            <p className="text-xs text-gray-500 uppercase tracking-wider">Contactos</p>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {usuarios.length === 0 && (
+              <p className="text-xs text-gray-600 p-4">No hay otros usuarios registrados</p>
+            )}
+            {usuarios.map(u => (
+              <button key={u.id} onClick={() => seleccionarContacto(u)}
+                className={`w-full text-left px-4 py-3 hover:bg-gray-800 border-b border-gray-800 ${contactoSeleccionado?.id === u.id ? 'bg-gray-800' : ''}`}>
+                <p className="text-sm font-medium">{u.username}</p>
+                <p className="text-xs text-gray-500">{u.email}</p>
+              </button>
+            ))}
+          </div>
         </div>
 
-        <label className="text-xs text-gray-500">Email</label>
-        <input value={email} onChange={e => setEmail(e.target.value)}
-          type="email" placeholder="tu@email.com"
-          className="w-full mt-1 mb-4 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm focus:outline-none focus:border-blue-500" />
-
-        <label className="text-xs text-gray-500">Contrasena</label>
-        <input value={password} onChange={e => setPassword(e.target.value)}
-          type="password" placeholder="••••••••"
-          className="w-full mt-1 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm focus:outline-none focus:border-blue-500" />
-
-        {fortaleza && (
-          <div className="mt-2 mb-4">
-            <div className="w-full bg-gray-800 rounded-full h-1.5">
-              <div style={{ width: fortaleza.ancho, backgroundColor: fortaleza.color, height: '6px', borderRadius: '9999px', transition: 'all 0.3s' }}></div>
+        <div className="flex-1 flex flex-col">
+          {!contactoSeleccionado ? (
+            <div className="flex-1 flex items-center justify-center">
+              <p className="text-gray-600">Selecciona un contacto para chatear</p>
             </div>
-            <p style={{ color: fortaleza.color }} className="text-xs mt-1">{fortaleza.nivel}</p>
-            {password.length < 8 && <p className="text-xs text-gray-600 mt-1">Minimo 8 caracteres</p>}
-          </div>
-        )}
-
-        {!fortaleza && <div className="mb-4" />}
-
-        <button onClick={handleSubmit} disabled={cargando}
-          className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg text-sm disabled:opacity-50">
-          {cargando ? 'Cargando...' : esRegistro ? 'Crear cuenta' : 'Ingresar'}
-        </button>
-
-        {mensaje && <p className="mt-4 text-sm text-center text-yellow-400">{mensaje}</p>}
+          ) : !clavesConfiguradas ? (
+            <div className="flex-1 flex items-center justify-center p-6">
+              <div className="w-full max-w-sm bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 className="text-lg font-semibold mb-1">Chat con {contactoSeleccionado.username}</h2>
+                <p className="text-xs text-gray-500 mb-6">Acorda estas claves con {contactoSeleccionado.username} antes de chatear</p>
+                <label className="text-xs text-gray-500">Clave Vigenere</label>
+                <input value={claveVig} onChange={e => setClaveVig(e.target.value)}
+                  className="w-full mt-1 mb-4 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm focus:outline-none focus:border-blue-500"
+                  placeholder="ej: salta2025" />
+                <label className="text-xs text-gray-500">Clave AES</label>
+                <input value={claveAes} onChange={e => setClaveAes(e.target.value)}
+                  className="w-full mt-1 mb-6 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm focus:outline-none focus:border-blue-500"
+                  placeholder="ej: mi-clave-secreta" />
+                <button onClick={configurarClaves}
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg text-sm">
+                  Iniciar chat
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex-1 flex flex-col overflow-hidden">
+              <div className="px-6 py-3 border-b border-gray-800 bg-gray-900">
+                <p className="text-sm font-medium">{contactoSeleccionado.username}</p>
+                <p className="text-xs text-gray-500">{contactoSeleccionado.email}</p>
+              </div>
+              <div ref={mensajesRef} className="flex-1 overflow-y-auto p-6 space-y-4">
+                {mensajes.length === 0 && (
+                  <p className="text-center text-gray-600 text-sm mt-8">No hay mensajes aun.</p>
+                )}
+                {mensajes.map(msg => (
+                  <div key={msg.id} className={`flex flex-col ${msg.emisor_id === usuario.id ? 'items-end' : 'items-start'}`}>
+                    <div className={`max-w-md rounded-xl p-3 ${msg.emisor_id === usuario.id ? 'bg-blue-600 rounded-tr-none' : 'bg-gray-800 rounded-tl-none'}`}>
+                      <p className="text-sm">{msg.texto}</p>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2">
+                      <span className="text-xs text-gray-600">{new Date(msg.created_at).toLocaleTimeString()}</span>
+                      <span className={`text-xs ${msg.integro ? 'text-green-500' : 'text-red-500'}`}>
+                        {msg.integro ? 'Integro' : 'Alterado'}
+                      </span>
+                    </div>
+                    <details className="mt-1 max-w-md">
+                      <summary className="text-xs text-gray-600 cursor-pointer hover:text-gray-400">
+                        Ver cifrado
+                      </summary>
+                      <div className="bg-gray-900 rounded-lg p-2 mt-1">
+                        <p className="text-xs text-gray-500 break-all">{msg.contenido_cifrado}</p>
+                      </div>
+                    </details>
+                  </div>
+                ))}
+              </div>
+              <div className="bg-gray-900 border-t border-gray-800 p-4 flex flex-col gap-2">
+                {errorMensaje && <p className="text-red-400 text-xs">{errorMensaje}</p>}
+                <div className="flex gap-3">
+                  <input value={mensaje} onChange={e => setMensaje(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && enviarMensaje()}
+                    className="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-blue-500"
+                    placeholder="Escribe un mensaje..." />
+                  <button onClick={enviarMensaje}
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg text-sm">
+                    Enviar
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </main>
   );
