@@ -9,6 +9,12 @@ import { z } from 'zod';
 const mensajeSchema = z.string().min(1, 'El mensaje no puede estar vacio').max(2000, 'El mensaje es demasiado largo');
 const claveSchema = z.string().min(3, 'La clave debe tener al menos 3 caracteres');
 
+function CheckStatus({ enviado, leido }: { enviado: boolean, leido: boolean }) {
+  if (leido) return <span className="text-blue-400 text-xs">✓✓</span>;
+  if (enviado) return <span className="text-gray-500 text-xs">✓✓</span>;
+  return <span className="text-gray-600 text-xs">✓</span>;
+}
+
 export default function ChatPage() {
   const [usuario, setUsuario] = useState<any>(null);
   const [usuarios, setUsuarios] = useState<any[]>([]);
@@ -106,7 +112,18 @@ export default function ChatPage() {
     setConversacionId(convId);
     setClavesConfiguradas(true);
     await cargarMensajes(convId, claveVig, claveAes);
+    await marcarComoLeidos(convId);
     suscribirMensajes(convId, claveVig, claveAes);
+  };
+
+  const marcarComoLeidos = async (convId: string) => {
+    if (!usuario) return;
+    await supabase
+      .from('mensajes')
+      .update({ leido: true })
+      .eq('conversacion_id', convId)
+      .neq('emisor_id', usuario.id)
+      .eq('leido', false);
   };
 
   const cargarMensajes = async (convId: string, vig: string, aes: string) => {
@@ -137,14 +154,26 @@ export default function ChatPage() {
         schema: 'public',
         table: 'mensajes',
         filter: `conversacion_id=eq.${convId}`,
-      }, (payload) => {
+      }, async (payload) => {
         const msg = payload.new as any;
         try {
           const texto = descifrar(msg.contenido_cifrado, vig, aes);
           setMensajes(prev => [...prev, { ...msg, texto, integro: true }]);
+          if (msg.emisor_id !== usuario?.id) {
+            await supabase.from('mensajes').update({ leido: true }).eq('id', msg.id);
+          }
         } catch {
           setMensajes(prev => [...prev, { ...msg, texto: '[No se pudo descifrar]', integro: false }]);
         }
+      })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'mensajes',
+        filter: `conversacion_id=eq.${convId}`,
+      }, (payload) => {
+        const msgActualizado = payload.new as any;
+        setMensajes(prev => prev.map(m => m.id === msgActualizado.id ? { ...m, leido: msgActualizado.leido } : m));
       })
       .subscribe();
   };
@@ -164,12 +193,14 @@ export default function ChatPage() {
       const mensajeLimpio = DOMPurify.sanitize(mensaje).trim();
       if (!mensajeLimpio) return;
       const contenidoCifrado = cifrar(mensajeLimpio, claveVig, claveAes);
-      
+      const hash = btoa(encodeURIComponent(mensajeLimpio)).slice(0, 32);
+
       await supabase.from('mensajes').insert({
         conversacion_id: conversacionId,
         emisor_id: usuario.id,
         contenido_cifrado: contenidoCifrado,
         hash,
+        leido: false,
       });
 
       setMensaje('');
@@ -256,11 +287,19 @@ export default function ChatPage() {
                     <div className={`max-w-md rounded-xl p-3 ${msg.emisor_id === usuario.id ? 'bg-blue-600 rounded-tr-none' : 'bg-gray-800 rounded-tl-none'}`}>
                       <p className="text-sm">{msg.texto}</p>
                     </div>
-                    <div className="mt-1 flex items-center gap-2">
+                    <div className="mt-1 flex items-center gap-2 flex-wrap">
                       <span className="text-xs text-gray-600">{new Date(msg.created_at).toLocaleTimeString()}</span>
+                      {msg.emisor_id === usuario.id && (
+                        <CheckStatus enviado={true} leido={msg.leido} />
+                      )}
                       <span className={`text-xs ${msg.integro ? 'text-green-500' : 'text-red-500'}`}>
                         {msg.integro ? 'Integro' : 'Alterado'}
                       </span>
+                      {msg.destruir_en && (
+                        <span className="text-xs text-orange-400">
+                          Expira: {new Date(msg.destruir_en).toLocaleString()}
+                        </span>
+                      )}
                     </div>
                     <details className="mt-1 max-w-md">
                       <summary className="text-xs text-gray-600 cursor-pointer hover:text-gray-400">
