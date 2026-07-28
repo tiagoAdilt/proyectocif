@@ -15,9 +15,12 @@ function CheckStatus({ enviado, leido }: { enviado: boolean, leido: boolean }) {
   return <span className="text-gray-600 text-xs">✓</span>;
 }
 
+type Vista = 'chats' | 'buscar' | 'solicitudes';
+
 export default function ChatPage() {
   const [usuario, setUsuario] = useState<any>(null);
-  const [usuarios, setUsuarios] = useState<any[]>([]);
+  const [contactos, setContactos] = useState<any[]>([]);
+  const [solicitudesPendientes, setSolicitudesPendientes] = useState<any[]>([]);
   const [contactoSeleccionado, setContactoSeleccionado] = useState<any>(null);
   const [mensajes, setMensajes] = useState<any[]>([]);
   const [mensaje, setMensaje] = useState('');
@@ -26,6 +29,10 @@ export default function ChatPage() {
   const [clavesConfiguradas, setClavesConfiguradas] = useState(false);
   const [conversacionId, setConversacionId] = useState<string | null>(null);
   const [errorMensaje, setErrorMensaje] = useState('');
+  const [vista, setVista] = useState<Vista>('chats');
+  const [busqueda, setBusqueda] = useState('');
+  const [resultadosBusqueda, setResultadosBusqueda] = useState<any[]>([]);
+  const [buscando, setBuscando] = useState(false);
   const mensajesRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -43,7 +50,8 @@ export default function ChatPage() {
       if (!data.user) window.location.href = '/login';
       else {
         setUsuario(data.user);
-        cargarUsuarios(data.user.id);
+        cargarContactos(data.user.id);
+        cargarSolicitudes(data.user.id);
       }
     });
   }, []);
@@ -65,12 +73,71 @@ export default function ChatPage() {
     }
   }, [mensajes]);
 
-  const cargarUsuarios = async (miId: string) => {
+  const cargarContactos = async (miId: string) => {
+    const { data } = await supabase
+      .from('solicitudes_contacto')
+      .select(`
+        id,
+        emisor_id,
+        receptor_id,
+        emisor:usuarios!solicitudes_contacto_emisor_id_fkey(id, username, email),
+        receptor:usuarios!solicitudes_contacto_receptor_id_fkey(id, username, email)
+      `)
+      .eq('estado', 'aceptado')
+      .or(`emisor_id.eq.${miId},receptor_id.eq.${miId}`);
+
+    if (data) {
+      const lista = data.map(s => s.emisor_id === miId ? s.receptor : s.emisor);
+      setContactos(lista);
+    }
+  };
+
+  const cargarSolicitudes = async (miId: string) => {
+    const { data } = await supabase
+      .from('solicitudes_contacto')
+      .select(`
+        id,
+        emisor:usuarios!solicitudes_contacto_emisor_id_fkey(id, username, email)
+      `)
+      .eq('receptor_id', miId)
+      .eq('estado', 'pendiente');
+
+    if (data) setSolicitudesPendientes(data);
+  };
+
+  const buscarUsuarios = async () => {
+    if (!busqueda || !usuario) return;
+    setBuscando(true);
     const { data } = await supabase
       .from('usuarios')
       .select('*')
-      .neq('id', miId);
-    if (data) setUsuarios(data);
+      .ilike('email', `%${busqueda}%`)
+      .neq('id', usuario.id)
+      .limit(5);
+    if (data) setResultadosBusqueda(data);
+    setBuscando(false);
+  };
+
+  const enviarSolicitud = async (receptorId: string) => {
+    if (!usuario) return;
+    const { error } = await supabase
+      .from('solicitudes_contacto')
+      .insert({ emisor_id: usuario.id, receptor_id: receptorId });
+    if (error) alert('Error: ' + error.message);
+    else alert('Solicitud enviada.');
+    setResultadosBusqueda([]);
+    setBusqueda('');
+  };
+
+  const responderSolicitud = async (solicitudId: string, accion: 'aceptado' | 'rechazado') => {
+    await supabase
+      .from('solicitudes_contacto')
+      .update({ estado: accion })
+      .eq('id', solicitudId);
+    if (usuario) {
+      cargarSolicitudes(usuario.id);
+      cargarContactos(usuario.id);
+    }
   };
 
   const seleccionarContacto = (contacto: any) => {
@@ -81,12 +148,12 @@ export default function ChatPage() {
     setClaveVig('');
     setClaveAes('');
     setErrorMensaje('');
+    setVista('chats');
   };
 
   const configurarClaves = async () => {
     const vigResult = claveSchema.safeParse(claveVig);
     const aesResult = claveSchema.safeParse(claveAes);
-
     if (!vigResult.success) { alert('Clave Vigenere invalida: ' + vigResult.error.errors[0].message); return; }
     if (!aesResult.success) { alert('Clave AES invalida: ' + aesResult.error.errors[0].message); return; }
     if (!usuario || !contactoSeleccionado) return;
@@ -98,7 +165,6 @@ export default function ChatPage() {
       .single();
 
     let convId = existente?.id;
-
     if (!convId) {
       const { data, error } = await supabase
         .from('conversaciones')
@@ -149,52 +215,37 @@ export default function ChatPage() {
   const suscribirMensajes = (convId: string, vig: string, aes: string) => {
     supabase
       .channel('mensajes-' + convId)
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'mensajes',
-        filter: `conversacion_id=eq.${convId}`,
-      }, async (payload) => {
-        const msg = payload.new as any;
-        try {
-          const texto = descifrar(msg.contenido_cifrado, vig, aes);
-          setMensajes(prev => [...prev, { ...msg, texto, integro: true }]);
-          if (msg.emisor_id !== usuario?.id) {
-            await supabase.from('mensajes').update({ leido: true }).eq('id', msg.id);
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mensajes', filter: `conversacion_id=eq.${convId}` },
+        async (payload) => {
+          const msg = payload.new as any;
+          try {
+            const texto = descifrar(msg.contenido_cifrado, vig, aes);
+            setMensajes(prev => [...prev, { ...msg, texto, integro: true }]);
+            if (msg.emisor_id !== usuario?.id) {
+              await supabase.from('mensajes').update({ leido: true }).eq('id', msg.id);
+            }
+          } catch {
+            setMensajes(prev => [...prev, { ...msg, texto: '[No se pudo descifrar]', integro: false }]);
           }
-        } catch {
-          setMensajes(prev => [...prev, { ...msg, texto: '[No se pudo descifrar]', integro: false }]);
-        }
-      })
-      .on('postgres_changes', {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'mensajes',
-        filter: `conversacion_id=eq.${convId}`,
-      }, (payload) => {
-        const msgActualizado = payload.new as any;
-        setMensajes(prev => prev.map(m => m.id === msgActualizado.id ? { ...m, leido: msgActualizado.leido } : m));
-      })
+        })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'mensajes', filter: `conversacion_id=eq.${convId}` },
+        (payload) => {
+          const msgActualizado = payload.new as any;
+          setMensajes(prev => prev.map(m => m.id === msgActualizado.id ? { ...m, leido: msgActualizado.leido } : m));
+        })
       .subscribe();
   };
 
   const enviarMensaje = async () => {
     if (!clavesConfiguradas || !conversacionId || !usuario) return;
-
     const resultado = mensajeSchema.safeParse(mensaje);
-    if (!resultado.success) {
-      setErrorMensaje(resultado.error.errors[0].message);
-      return;
-    }
-
+    if (!resultado.success) { setErrorMensaje(resultado.error.errors[0].message); return; }
     setErrorMensaje('');
-
     try {
       const mensajeLimpio = DOMPurify.sanitize(mensaje).trim();
       if (!mensajeLimpio) return;
       const contenidoCifrado = cifrar(mensajeLimpio, claveVig, claveAes);
       const hash = btoa(encodeURIComponent(mensajeLimpio)).slice(0, 32);
-
       await supabase.from('mensajes').insert({
         conversacion_id: conversacionId,
         emisor_id: usuario.id,
@@ -202,7 +253,6 @@ export default function ChatPage() {
         hash,
         leido: false,
       });
-
       setMensaje('');
     } catch (e: any) {
       alert('Error al cifrar: ' + e.message);
@@ -231,20 +281,90 @@ export default function ChatPage() {
 
       <div className="flex flex-1 overflow-hidden">
         <div className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
-          <div className="p-4 border-b border-gray-800">
-            <p className="text-xs text-gray-500 uppercase tracking-wider">Contactos</p>
+          <div className="flex border-b border-gray-800">
+            <button onClick={() => setVista('chats')}
+              className={`flex-1 py-3 text-xs ${vista === 'chats' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-500'}`}>
+              Chats
+            </button>
+            <button onClick={() => setVista('buscar')}
+              className={`flex-1 py-3 text-xs ${vista === 'buscar' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-500'}`}>
+              Buscar
+            </button>
+            <button onClick={() => setVista('solicitudes')}
+              className={`flex-1 py-3 text-xs relative ${vista === 'solicitudes' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-500'}`}>
+              Solicitudes
+              {solicitudesPendientes.length > 0 && (
+                <span className="absolute top-2 right-2 bg-red-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center">
+                  {solicitudesPendientes.length}
+                </span>
+              )}
+            </button>
           </div>
+
           <div className="flex-1 overflow-y-auto">
-            {usuarios.length === 0 && (
-              <p className="text-xs text-gray-600 p-4">No hay otros usuarios registrados</p>
+            {vista === 'chats' && (
+              <>
+                {contactos.length === 0 && (
+                  <p className="text-xs text-gray-600 p-4">No tenes contactos aun. Busca usuarios para agregar.</p>
+                )}
+                {contactos.map(c => (
+                  <button key={c.id} onClick={() => seleccionarContacto(c)}
+                    className={`w-full text-left px-4 py-3 hover:bg-gray-800 border-b border-gray-800 ${contactoSeleccionado?.id === c.id ? 'bg-gray-800' : ''}`}>
+                    <p className="text-sm font-medium">{c.username}</p>
+                    <p className="text-xs text-gray-500">{c.email}</p>
+                  </button>
+                ))}
+              </>
             )}
-            {usuarios.map(u => (
-              <button key={u.id} onClick={() => seleccionarContacto(u)}
-                className={`w-full text-left px-4 py-3 hover:bg-gray-800 border-b border-gray-800 ${contactoSeleccionado?.id === u.id ? 'bg-gray-800' : ''}`}>
-                <p className="text-sm font-medium">{u.username}</p>
-                <p className="text-xs text-gray-500">{u.email}</p>
-              </button>
-            ))}
+
+            {vista === 'buscar' && (
+              <div className="p-3">
+                <input value={busqueda} onChange={e => setBusqueda(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && buscarUsuarios()}
+                  className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+                  placeholder="Buscar por email..." />
+                <button onClick={buscarUsuarios}
+                  className="w-full mt-2 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-xs">
+                  {buscando ? 'Buscando...' : 'Buscar'}
+                </button>
+                <div className="mt-3 space-y-2">
+                  {resultadosBusqueda.map(u => (
+                    <div key={u.id} className="bg-gray-800 rounded-lg p-3">
+                      <p className="text-sm font-medium">{u.username}</p>
+                      <p className="text-xs text-gray-500 mb-2">{u.email}</p>
+                      <button onClick={() => enviarSolicitud(u.id)}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white py-1 rounded text-xs">
+                        Agregar contacto
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {vista === 'solicitudes' && (
+              <div className="p-3 space-y-3">
+                {solicitudesPendientes.length === 0 && (
+                  <p className="text-xs text-gray-600">No tenes solicitudes pendientes.</p>
+                )}
+                {solicitudesPendientes.map(s => (
+                  <div key={s.id} className="bg-gray-800 rounded-lg p-3">
+                    <p className="text-sm font-medium">{s.emisor.username}</p>
+                    <p className="text-xs text-gray-500 mb-2">{s.emisor.email}</p>
+                    <div className="flex gap-2">
+                      <button onClick={() => responderSolicitud(s.id, 'aceptado')}
+                        className="flex-1 bg-green-600 hover:bg-green-700 text-white py-1 rounded text-xs">
+                        Aceptar
+                      </button>
+                      <button onClick={() => responderSolicitud(s.id, 'rechazado')}
+                        className="flex-1 bg-red-600 hover:bg-red-700 text-white py-1 rounded text-xs">
+                        Rechazar
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -289,17 +409,10 @@ export default function ChatPage() {
                     </div>
                     <div className="mt-1 flex items-center gap-2 flex-wrap">
                       <span className="text-xs text-gray-600">{new Date(msg.created_at).toLocaleTimeString()}</span>
-                      {msg.emisor_id === usuario.id && (
-                        <CheckStatus enviado={true} leido={msg.leido} />
-                      )}
+                      {msg.emisor_id === usuario.id && <CheckStatus enviado={true} leido={msg.leido} />}
                       <span className={`text-xs ${msg.integro ? 'text-green-500' : 'text-red-500'}`}>
                         {msg.integro ? 'Integro' : 'Alterado'}
                       </span>
-                      {msg.destruir_en && (
-                        <span className="text-xs text-orange-400">
-                          Expira: {new Date(msg.destruir_en).toLocaleString()}
-                        </span>
-                      )}
                     </div>
                     <details className="mt-1 max-w-md">
                       <summary className="text-xs text-gray-600 cursor-pointer hover:text-gray-400">
