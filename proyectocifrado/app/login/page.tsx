@@ -1,4 +1,5 @@
 'use client';
+import MarcaSeguridad from '../componentes/MarcaSeguridad';
 
 import { useState } from 'react';
 import { supabase } from '../../lib/supabase';
@@ -29,27 +30,38 @@ export default function LoginPage() {
   const fortaleza = password ? evaluarContrasena(password) : null;
 
   const handleSubmit = async () => {
-    if (esRegistro && password.length < 8) {
-      setMensaje('La contrasena debe tener al menos 8 caracteres.');
+    if (cargando) return;
+    if (!email.trim() || !password) {
+      setMensaje('Ingresá tu correo y contraseña.');
+      return;
+    }
+    if (esRegistro && password.length < 12) {
+      setMensaje('La contraseña debe tener al menos 12 caracteres. Podés usar una frase larga.');
       return;
     }
     setCargando(true);
     setMensaje('');
+    try {
     if (esRegistro) {
-      const { error } = await supabase.auth.signUp({ email, password });
+      const { data, error } = await supabase.auth.signUp({ email: email.trim(), password });
       if (error) setMensaje('Error: ' + error.message);
-      else setMensaje('Registro exitoso. Ya podes iniciar sesion.');
+      else setMensaje(data.session ? 'Cuenta creada. Ya podés iniciar sesión.' : 'Revisá tu correo y confirmá tu cuenta antes de iniciar sesión. Si no aparece, mirá la carpeta de spam.');
     } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
       if (error) setMensaje('Error: ' + error.message);
-      else window.location.href = '/chat';
+      else window.location.replace('/chat');
     }
-    setCargando(false);
+    } catch {
+      setMensaje('No pudimos conectar. Revisá tu conexión y volvé a intentar.');
+    } finally {
+      setCargando(false);
+    }
   };
 
   return (
-    <main className="min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center p-6">
+    <main className="auth-shell min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center p-6">
       <div className="w-full max-w-sm bg-gray-900 rounded-xl border border-gray-800 p-8">
+        <MarcaSeguridad />
         <h1 className="text-2xl font-semibold mb-1 text-center">Sistema de Cifrado</h1>
         <p className="text-gray-500 text-sm mb-8 text-center">E.E.T. N°3139</p>
 
@@ -95,8 +107,8 @@ export default function LoginPage() {
           <div className="mt-3 mb-4 bg-gray-950 border border-gray-800 rounded-lg p-3">
             <p className="text-xs text-gray-500 mb-2 font-medium">Para una contrasena segura:</p>
             <ul className="space-y-1">
-              <li className={`text-xs flex items-center gap-2 ${password.length >= 8 ? 'text-green-400' : 'text-gray-600'}`}>
-                {password.length >= 8 ? '✓' : '○'} Al menos 8 caracteres
+              <li className={`text-xs flex items-center gap-2 ${password.length >= 12 ? 'text-green-400' : 'text-gray-600'}`}>
+                {password.length >= 12 ? '✓' : '○'} Al menos 12 caracteres
               </li>
               <li className={`text-xs flex items-center gap-2 ${/[A-Z]/.test(password) ? 'text-green-400' : 'text-gray-600'}`}>
                 {/[A-Z]/.test(password) ? '✓' : '○'} Una letra mayuscula (ej: A, B, C)
@@ -111,7 +123,7 @@ export default function LoginPage() {
           </div>
         )}
 
-        {!esRegistro && <div className="mb-4" />}
+        {!esRegistro && <div className="my-4 text-right"><a href="/recuperar-contrasena" className="text-sm text-blue-300 hover:underline">Olvidé mi contraseña</a></div>}
 
         <button onClick={handleSubmit} disabled={cargando}
           className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg text-sm disabled:opacity-50">
